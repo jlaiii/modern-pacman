@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#070a12">
 <meta name="description" content="Modern Pac-Man — six game modes, hidden cheats, mobile-first. Single-file HTML5 game.">
 <title>Modern Pac-Man</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23ffd93d'/%3E%3Cpath d='M16 16 L30 8 A14 14 0 0 0 30 24 Z' fill='%230b1220'/%3E%3C/svg%3E">
 <style>
 *{box-sizing:border-box}
 [hidden]{display:none !important}
@@ -1664,7 +1665,7 @@ function closeCheatDrawer(){
 function registerSecretTap(){
   tapCount++;
   clearTimeout(tapTimer);
-  tapTimer = setTimeout(function(){ tapCount = 0; }, 620);
+  tapTimer = setTimeout(function(){ tapCount = 0; }, 900);
   if(tapCount >= 3){
     tapCount = 0;
     clearTimeout(tapTimer);
