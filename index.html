@@ -519,7 +519,7 @@ var CHEAT_GROUPS = [
 ];
 var CHEATS = [
   { id:"invincible",  group:"play",  quick:true, label:"Invincible",     desc:"Ghosts cannot touch you.", type:"toggle" },
-  { id:"autoPilot",   group:"play",  quick:true, label:"Auto-pilot",     desc:"Pac-Man plays itself — claims pellets and dodges ghosts.", type:"toggle" },
+  { id:"autoPilot",   group:"play",  quick:true, label:"Auto-pilot",     desc:"Pac-Man plays itself — simulates the ghosts to plan safe routes, hunts them when they turn blue.", type:"toggle" },
   { id:"pelletMagnet",group:"play",  label:"Pellet magnet", desc:"Sweeps up pellets within two tiles as you pass.", type:"toggle" },
   { id:"boost",       group:"play",  quick:true, label:"Speed boost",     desc:"Pac-Man runs 45% faster.", type:"toggle" },
   { id:"slowMo",      group:"play",  label:"Slow motion",    desc:"The whole board runs at a third speed.", type:"toggle" },
@@ -1050,108 +1050,490 @@ function anyCheatOn(){
 }
 
 /* ============================ auto-pilot ============================ */
-function ghostDangerLevel(c, r, radius){
-  var worst = 99;
+/* Fast hands, smart feet.
+   Targeting is the greedy nearest-food sweep that clears a board quickly: a breadth-first
+   walk out from Pac-Man, taking the closest pellet, scored against the clock instead of
+   against the walls. What is new is the safety layer underneath it, which is built from a
+   real simulation rather than a distance guess:
+     - botThreatMap() clones the four ghosts and runs the actual ghost AI forward, giving
+       the earliest tick a hunting ghost can stand on every tile;
+     - the sweep refuses any tile a ghost reaches before Pac does, so it routes around a
+       pack instead of through it;
+     - the committed move is checked for a "pinch" — a ghost entering that tile or a
+       neighbour while Pac is there. Two entities walking at each other collide at three
+       quarters of a tile, long before either one arrives, which is what a pure
+       arrives-before-ghost test misses;
+     - when that fails, four escape options are rehearsed in full simulation (ghosts
+       chasing a moving Pac, same collision radius) and the longest survivor is taken.
+   Energizers stay in reserve as escape valves, fruit is worth a detour, and a frightened
+   ghost is worth chasing while the fright clock still covers the trip. */
+var BOT = {
+  horizon: 300,          /* ticks of ghost prediction (~5 s at 60 Hz) */
+  fleeTicks: 130,        /* simulated length of an escape option */
+  gateTicks: 90,         /* how far ahead the safety rehearsal looks (~1.5 s) */
+  evadeRange: 4,         /* start dodging when a hunter is this close (manhattan tiles) */
+  thinkEvery: 18, urgentEvery: 3,
+  threat: null, goal: null, target: null, mode: "plan", decisions: 0, age: 999, rollouts: 0,
+  stats: { plan:0, gateReject:0, pinchReject:0, escape:0, reachable:0, noTarget:0, earlyEvade:0 }, lastTile: ""
+};
+var BOT_TICK = 16.7;     /* ms per simulated tick — matches advance()'s default step */
+
+function botHunting(g){ return g.mode === "chase" || g.mode === "scatter" || g.mode === "house-out"; }
+function botClones(){
+  var sim = [];
   for(var i=0;i<ghosts.length;i++){
     var g = ghosts[i];
-    if(g.mode === "fright") continue;
-    if(g.mode === "house" || g.mode === "eyes") continue;
-    var d = Math.abs(g.c - c) + Math.abs(g.r - r);
-    if(d < worst) worst = d;
+    sim.push({ name:g.name, color:g.color, idx:g.idx, c:g.c, r:g.r, p:g.p, dir:g.dir, mode:g.mode,
+               target:{ c:g.target.c, r:g.target.r }, bob:g.bob, release:g.release, home:g.home });
   }
-  return worst;
+  return sim;
 }
-function nearestGoalTile(kinds){
-  var q = [{ c:pac.c, r:pac.r }], seen = {}, order = [];
-  seen[pac.c + "," + pac.r] = true;
-  var head = 0;
-  while(head < q.length && head < 700){
-    var t = q[head++];
-    var tt = tileAt(t.c, t.r);
-    if(kinds.indexOf(tt) >= 0 && !(t.c === pac.c && t.r === pac.r)) return t;
-    for(var i=0;i<DIR_ORDER.length;i++){
-      var d = DIRS[DIR_ORDER[i]], nc = wrapC(t.c + d.x), nr = t.r + d.y;
+function botThreatAt(threat, c, r){
+  var i = r * COLS + wrapC(c);
+  return threat[i] === 32000 ? 1e6 : threat[i];
+}
+function botGhostsClose(n){
+  var count = 0;
+  for(var i=0;i<ghosts.length;i++){
+    var g = ghosts[i];
+    if(!botHunting(g)) continue;
+    if(Math.abs(g.c - pac.c) + Math.abs(g.r - pac.r) <= n) count++;
+  }
+  return count;
+}
+/* earliest tick a hunting ghost can stand on each tile; the real ghost AI, run forward */
+function botThreatMap(){
+  var map = new Int16Array(ROWS * COLS);
+  for(var i=0;i<map.length;i++) map[i] = 32000;
+  var real = ghosts, sim = botClones();
+  ghosts = sim;                                     /* ghostTarget() reads ghosts[0] (Inky) */
+  var phase = S.phase, phaseT = S.phaseT, scatter = S.scatter, fright = S.fright;
+  var dt = BOT_TICK / 1000;
+  for(var t=0;t<BOT.horizon;t++){
+    phaseT += BOT_TICK;
+    var dur = SCATTER_PLAN[Math.min(phase, SCATTER_PLAN.length-1)] * 1000;
+    if(phaseT >= dur){
+      phaseT = 0; phase++; scatter = (phase % 2) === 0;
+      var keep = S.scatter; S.scatter = scatter; applyPhase(); S.scatter = keep;
+    }
+    if(fright > 0){
+      fright -= BOT_TICK;
+      if(fright <= 0){ fright = 0; for(var f=0;f<4;f++) if(sim[f].mode === "fright") sim[f].mode = scatter ? "scatter" : "chase"; }
+    }
+    for(var k=0;k<sim.length;k++){
+      var g = sim[k];
+      ghostStep(g, dt);
+      if(botHunting(g)){
+        var idx = g.r * COLS + wrapC(g.c);
+        if(map[idx] > t) map[idx] = t;
+      }
+    }
+  }
+  ghosts = real;
+  return map;
+}
+/* is a ghost about to occupy this tile, or one next to it, at the moment pac arrives? */
+function botPinched(threat, c, r, at, perTile){
+  if(Math.abs(botThreatAt(threat, c, r) - at) < perTile * 1.15) return true;
+  for(var k=0;k<DIR_ORDER.length;k++){
+    var d = DIRS[DIR_ORDER[k]];
+    var nr = r + d.y;
+    if(nr < 0 || nr >= ROWS) continue;
+    if(Math.abs(botThreatAt(threat, wrapC(c + d.x), nr) - at) < perTile * 1.15) return true;
+  }
+  return false;
+}
+function botFrontier(perTile){
+  var out = [], stopped = !pac.moving || pac.p === 0;
+  for(var i=0;i<DIR_ORDER.length;i++){
+    var name = DIR_ORDER[i], d = DIRS[name];
+    var nc = wrapC(pac.c + d.x), nr = pac.r + d.y;
+    if(nr < 0 || nr >= ROWS) continue;
+    if(!canWalk(nc, nr, false)) continue;
+    if(stopped) out.push({ c:nc, r:nr, dir:name, cost:perTile });
+    else if(name === pac.dir) out.push({ c:nc, r:nr, dir:name, cost:(1 - pac.p) * perTile });
+    else if(name === OPP[pac.dir]) out.push({ c:nc, r:nr, dir:name, cost:pac.p * perTile });
+    else out.push({ c:nc, r:nr, dir:name, cost:(1 - pac.p) * perTile });   /* perpendicular turn */
+    /* All three are legal mid-tile in pacTurn(). Omitting the perpendicular made the planner
+       believe its only route to an adjacent tile was to reverse and come back, and since the
+       reverse is always the cheapest step it did exactly that, forever: pac ping-ponged between
+       two tiles while the board sat uneaten. */
+  }
+  return out;
+}
+/* breadth-first sweep: arrival tick per tile, and the first move that gets there */
+function botReach(frontier, perTile){
+  var arrive = new Float32Array(ROWS * COLS), first = new Array(ROWS * COLS), from = new Int32Array(ROWS * COLS);
+  for(var i=0;i<arrive.length;i++){ arrive[i] = 1e9; from[i] = -1; }
+  var q = [], head = 0;
+  for(var f=0;f<frontier.length;f++){
+    var s = frontier[f], si = s.r * COLS + s.c;
+    if(arrive[si] > s.cost){ arrive[si] = s.cost; first[si] = s.dir; from[si] = -1; q.push({ c:s.c, r:s.r }); }
+  }
+  while(head < q.length && head < 900){
+    var t = q[head++], ti = t.r * COLS + t.c;
+    for(var k=0;k<DIR_ORDER.length;k++){
+      var d = DIRS[DIR_ORDER[k]];
+      var nc = wrapC(t.c + d.x), nr = t.r + d.y;
       if(nr < 0 || nr >= ROWS) continue;
       if(!canWalk(nc, nr, false)) continue;
-      var key = nc + "," + nr;
-      if(seen[key]) continue;
-      seen[key] = true;
+      var ni = nr * COLS + nc;
+      if(arrive[ni] <= arrive[ti] + perTile) continue;
+      arrive[ni] = arrive[ti] + perTile;
+      first[ni] = first[ti];
+      from[ni] = ti;
       q.push({ c:nc, r:nr });
     }
   }
-  return null;
+  return { arrive:arrive, first:first };
 }
-function fleeDirection(){
+/* distance field to a goal tile (BFS over walkable tiles) */
+function botDistField(gc, gr){
+  var d = new Int16Array(ROWS * COLS);
+  for(var i=0;i<d.length;i++) d[i] = 32000;
+  d[gr * COLS + wrapC(gc)] = 0;
+  var q = [{ c:wrapC(gc), r:gr }], head = 0;
+  while(head < q.length && head < 900){
+    var t = q[head++], ti = t.r * COLS + t.c;
+    for(var k=0;k<DIR_ORDER.length;k++){
+      var dd = DIRS[DIR_ORDER[k]];
+      var nc = wrapC(t.c + dd.x), nr = t.r + dd.y;
+      if(nr < 0 || nr >= ROWS) continue;
+      if(!canWalk(nc, nr, false)) continue;
+      var ni = nr * COLS + nc;
+      if(d[ni] <= d[ti] + 1) continue;
+      d[ni] = d[ti] + 1;
+      q.push({ c:nc, r:nr });
+    }
+  }
+  return d;
+}
+/* ---- escape rehearsal: ghosts chase a moving pac, real collision radius ---- */
+function botPickEscapeDir(sp){
   var best = null, bestScore = -1e9;
   for(var i=0;i<DIR_ORDER.length;i++){
     var name = DIR_ORDER[i], d = DIRS[name];
-    if(name === OPP[pac.dir]) continue;
-    var nc = wrapC(pac.c + d.x), nr = pac.r + d.y;
+    var nc = wrapC(sp.c + d.x), nr = sp.r + d.y;
+    if(nr < 0 || nr >= ROWS) continue;
     if(!canWalk(nc, nr, false)) continue;
-    var danger = ghostDangerLevel(nc, nr);
-    var open = 0;
-    for(var k=0;k<DIR_ORDER.length;k++){
-      var dd = DIRS[DIR_ORDER[k]];
-      if(canWalk(wrapC(nc + dd.x), nr + dd.y, false)) open++;
+    if(name === OPP[sp.dir] && sp.p === 0) continue;
+    var clear = 99;
+    for(var j=0;j<ghosts.length;j++){
+      var g = ghosts[j];
+      if(!botHunting(g)) continue;
+      var dd = Math.abs(g.c - nc) + Math.abs(g.r - nr);
+      if(dd < clear) clear = dd;
     }
-    var score = Math.min(danger, 12) * 4 + open * 2 + rnd() * 1.5;
+    var open = 0;
+    for(var k=0;k<DIR_ORDER.length;k++){ var d2 = DIRS[DIR_ORDER[k]]; if(canWalk(wrapC(nc + d2.x), nr + d2.y, false)) open++; }
+    var score = Math.min(clear, 12) * 10 + open * 2.5;
     if(score > bestScore){ bestScore = score; best = name; }
   }
   return best;
 }
-function autoPilotTick(){
-  var gh = nearestGoalTile([3]);
-  var near = ghostDangerLevel(pac.c, pac.r);
-  if(near <= 6 && gh){
-    /* hightail it to a power pellet if one is reachable */
-    pac.want = stepToward(gh);
-    return;
-  }
-  /* chase a scared ghost if it is close */
-  var scared = null, best = 99;
-  for(var i=0;i<ghosts.length;i++){
-    var g = ghosts[i];
-    if(g.mode !== "fright") continue;
-    var d = Math.abs(g.c - pac.c) + Math.abs(g.r - pac.r);
-    if(d < best && d <= 10){ best = d; scared = g; }
-  }
-  if(scared){
-    pac.want = stepToward({ c:scared.c, r:scared.r });
-    return;
-  }
-  if(near <= 5){
-    var f = fleeDirection();
-    if(f){ pac.want = f; return; }
-  }
-  var goal = nearestGoalTile([2, 3]) || nearestGoalTile([1]);
-  if(goal){
-    var dir = stepToward(goal);
-    if(dir){ pac.want = dir; return; }
-  }
-  var fb = fleeDirection();
-  if(fb) pac.want = fb;
+function botRehearseEscape(world, firstDir){
+  var realG = ghosts, realP = pac, sp = world.pac;
+  sp.c = pac.c; sp.r = pac.r; sp.p = pac.p; sp.dir = pac.dir; sp.moving = pac.moving; sp.want = firstDir;
+  world.ghosts = botClones();
+  ghosts = world.ghosts; pac = sp;
+  var dt = BOT_TICK / 1000, ticks = 0, hit = false, pellets = 0, eaten = {};
+  try {
+    if(sp.want === OPP[sp.dir]){
+      var bc = wrapC(sp.c + DIRS[sp.want].x), br = sp.r + DIRS[sp.want].y;
+      if(br >= 0 && br < ROWS && canWalk(bc, br, false)){ sp.dir = sp.want; sp.p = 1 - sp.p; sp.moving = true; }
+    }
+    while(ticks < BOT.fleeTicks){
+      ticks++;
+      if(!sp.moving && sp.want && canWalk(wrapC(sp.c + DIRS[sp.want].x), sp.r + DIRS[sp.want].y, false)){
+        sp.dir = sp.want; sp.moving = true; sp.p = 0;
+      }
+      var pd = DIRS[sp.dir];
+      if(sp.moving && !canWalk(wrapC(sp.c + pd.x), sp.r + pd.y, false)){ sp.moving = false; sp.p = 0; }
+      if(sp.moving){
+        var steps = pacSpeed() * dt, guard = 0;
+        while(steps > 0 && sp.moving && guard++ < 8){
+          var remain = 1 - sp.p;
+          if(steps >= remain){
+            steps -= remain;
+            sp.c = wrapC(sp.c + DIRS[sp.dir].x); sp.r += DIRS[sp.dir].y; sp.p = 0;
+            var key = sp.r * COLS + sp.c;
+            if(!eaten[key]){ eaten[key] = true; var kd = grid[sp.r][sp.c]; if(kd === 2 || kd === 3) pellets++; }
+            var nd = DIRS[sp.dir];
+            if(!canWalk(wrapC(sp.c + nd.x), sp.r + nd.y, false)){
+              if(sp.want && canWalk(wrapC(sp.c + DIRS[sp.want].x), sp.r + DIRS[sp.want].y, false)) sp.dir = sp.want;
+              else { sp.moving = false; sp.p = 0; break; }
+            }
+            sp.moving = true;
+            sp.want = botPickEscapeDir(sp) || sp.dir;
+          } else { sp.p += steps; steps = 0; }
+        }
+      }
+      for(var k=0;k<world.ghosts.length;k++) ghostStep(world.ghosts[k], dt);
+      var pp = entityPos(sp);
+      for(var j=0;j<world.ghosts.length;j++){
+        var g = world.ghosts[j];
+        if(g.mode === "eyes" || g.mode === "house") continue;
+        var gp = entityPos(g);
+        if(Math.abs(pp.x - gp.x) < 0.75 && Math.abs(pp.y - gp.y) < 0.75 && g.mode !== "fright"){ hit = true; break; }
+      }
+      if(hit) break;
+    }
+  } finally { ghosts = realG; pac = realP; }
+  return { alive:!hit, ticks:ticks, pellets:pellets };
 }
-function stepToward(goal){
-  var q = [{ c:pac.c, r:pac.r, first:null }], seen = {};
-  seen[pac.c + "," + pac.r] = true;
-  var head = 0;
-  while(head < q.length && head < 900){
+/* rehearse the committed move: the real ghost AI chasing a moving pac, real collision radius.
+   short horizon on purpose — the bot re-plans every tile, so this is a rolling check of the
+   next half second rather than a demand to survive the next three. */
+function botRehearseMove(world, firstDir, dist, horizon){
+  var realG = ghosts, realP = pac, sp = world.pac;
+  sp.c = pac.c; sp.r = pac.r; sp.p = pac.p; sp.dir = pac.dir; sp.moving = pac.moving; sp.want = firstDir;
+  world.ghosts = botClones();
+  ghosts = world.ghosts; pac = sp;
+  var dt = BOT_TICK / 1000, ticks = 0, hit = false, reached = false, pellets = 0, eaten = {};
+  try {
+    if(sp.want === OPP[sp.dir]){
+      var bc = wrapC(sp.c + DIRS[sp.want].x), br = sp.r + DIRS[sp.want].y;
+      if(br >= 0 && br < ROWS && canWalk(bc, br, false)){ sp.dir = sp.want; sp.p = 1 - sp.p; sp.moving = true; }
+    }
+    while(ticks < horizon){
+      ticks++;
+      if(!sp.moving && sp.want && canWalk(wrapC(sp.c + DIRS[sp.want].x), sp.r + DIRS[sp.want].y, false)){
+        sp.dir = sp.want; sp.moving = true; sp.p = 0;
+      }
+      var pd = DIRS[sp.dir];
+      if(sp.moving && !canWalk(wrapC(sp.c + pd.x), sp.r + pd.y, false)){ sp.moving = false; sp.p = 0; }
+      if(sp.moving){
+        var steps = pacSpeed() * dt, guard = 0;
+        while(steps > 0 && sp.moving && guard++ < 8){
+          var remain = 1 - sp.p;
+          if(steps >= remain){
+            steps -= remain;
+            sp.c = wrapC(sp.c + DIRS[sp.dir].x); sp.r += DIRS[sp.dir].y; sp.p = 0;
+            var key = sp.r * COLS + sp.c;
+            if(!eaten[key]){ eaten[key] = true; var kd = grid[sp.r][sp.c]; if(kd === 2 || kd === 3) pellets++; }
+            if(sp.c === world.goalC && sp.r === world.goalR) reached = true;
+            var nd = DIRS[sp.dir];
+            if(!canWalk(wrapC(sp.c + nd.x), sp.r + nd.y, false)){
+              if(sp.want && canWalk(wrapC(sp.c + DIRS[sp.want].x), sp.r + DIRS[sp.want].y, false)) sp.dir = sp.want;
+              else { sp.moving = false; sp.p = 0; break; }
+            }
+            sp.moving = true;
+            sp.want = botPickRunDir(sp, dist) || sp.dir;
+          } else { sp.p += steps; steps = 0; }
+        }
+      }
+      for(var k=0;k<world.ghosts.length;k++) ghostStep(world.ghosts[k], dt);
+      var pp = entityPos(sp);
+      for(var j=0;j<world.ghosts.length;j++){
+        var g = world.ghosts[j];
+        if(g.mode === "eyes" || g.mode === "house") continue;
+        var gp = entityPos(g);
+        if(Math.abs(pp.x - gp.x) < 0.75 && Math.abs(pp.y - gp.y) < 0.75 && g.mode !== "fright"){ hit = true; break; }
+      }
+      if(hit) break;
+    }
+  } finally { ghosts = realG; pac = realP; }
+  return { alive:!hit, ticks:ticks, pellets:pellets, reached:reached };
+}
+function botPickRunDir(sp, dist, fleeing){
+  var best = null, bestScore = -1e9;
+  for(var i=0;i<DIR_ORDER.length;i++){
+    var name = DIR_ORDER[i], d = DIRS[name];
+    var nc = wrapC(sp.c + d.x), nr = sp.r + d.y;
+    if(nr < 0 || nr >= ROWS) continue;
+    if(!canWalk(nc, nr, false)) continue;
+    if(name === OPP[sp.dir] && sp.p === 0) continue;
+    var clear = 99;
+    for(var j=0;j<ghosts.length;j++){
+      var g = ghosts[j];
+      if(!botHunting(g)) continue;
+      var dd = Math.abs(g.c - nc) + Math.abs(g.r - nr);
+      if(dd < clear) clear = dd;
+    }
+    var open = 0;
+    for(var k=0;k<DIR_ORDER.length;k++){ var d2 = DIRS[DIR_ORDER[k]]; if(canWalk(wrapC(nc + d2.x), nr + d2.y, false)) open++; }
+    var score;
+    if(clear <= 1) score = -1000 + clear * 10;
+    else if(fleeing) score = Math.min(clear, 12) * 10 + open * 2.5;
+    else score = -(dist ? dist[nr * COLS + nc] : 0) * 8 + Math.min(clear, 6) * 5 + open;
+    if(score > bestScore){ bestScore = score; best = name; }
+  }
+  return best;
+}
+/* how much open board is behind a tile: flood out over walkable tiles that no hunting ghost
+   covers within `radius`. A greedy dodge survives the next second but happily runs into a dead
+   end; this measures the room it is running towards. */
+function botRoom(c0, r0, radius, cap){
+  var seen = {}, q = [[c0, r0]], head = 0, n = 0;
+  seen[c0 + "," + r0] = true;
+  while(head < q.length && n < cap){
     var t = q[head++];
-    if(t.c === goal.c && t.r === goal.r) return t.first;
-    for(var i=0;i<DIR_ORDER.length;i++){
-      var name = DIR_ORDER[i], d = DIRS[name];
-      var nc = wrapC(t.c + d.x), nr = t.r + d.y;
+    var blocked = false;
+    for(var j=0;j<ghosts.length;j++){
+      var g = ghosts[j];
+      if(!botHunting(g)) continue;
+      if(Math.abs(g.c - t[0]) + Math.abs(g.r - t[1]) <= radius){ blocked = true; break; }
+    }
+    n++;
+    if(blocked) continue;
+    for(var k=0;k<DIR_ORDER.length;k++){
+      var d = DIRS[DIR_ORDER[k]], nc = wrapC(t[0] + d.x), nr = t[1] + d.y;
       if(nr < 0 || nr >= ROWS) continue;
       if(!canWalk(nc, nr, false)) continue;
       var key = nc + "," + nr;
       if(seen[key]) continue;
-      /* avoid tiles a dangerous ghost is sitting on or next to */
-      if(ghostDangerLevel(nc, nr) <= 1 && !(nc === goal.c && nr === goal.r)) continue;
       seen[key] = true;
-      q.push({ c:nc, r:nr, first: t.first || name });
+      q.push([nc, nr]);
     }
   }
-  return null;
+  return n;
+}
+function botEscape(){
+  BOT.mode = "flee"; BOT.goal = null; BOT.stats.escape++;
+  var world = { ghosts: [], pac: {} }, frontier = botFrontier((1000 / pacSpeed()) / BOT_TICK);
+  var pick = null, bestScore = -1e9;
+  for(var i=0;i<frontier.length;i++){
+    var s = frontier[i];
+    var res = botRehearseEscape(world, s.dir);
+    BOT.rollouts++;
+    var clear = 99;
+    for(var j=0;j<ghosts.length;j++){
+      var g = ghosts[j];
+      if(!botHunting(g)) continue;
+      var dd = Math.abs(g.c - s.c) + Math.abs(g.r - s.r);
+      if(dd < clear) clear = dd;
+    }
+    var room = botRoom(s.c, s.r, 2, 80);
+    /* survive the next two seconds first, then prefer the direction with board behind it */
+    var score = res.ticks * 3 + room * 8 + Math.min(clear, 8) * 5 + res.pellets;
+    if(score > bestScore){ bestScore = score; pick = s; }
+  }
+  if(pick) pac.want = pick.dir;
+}
+/* ---- target choice: nearest food the ghosts do not get to first ---- */
+function botChooseTarget(threat, arrive, first, perTile){
+  var best = null, bestCost = 1e18, cachedCost = 1e18;
+  var cached = BOT.target;
+  var near = botGhostsClose(9);
+  var fruitAlive = !!S.fruit;
+  for(var r=0;r<ROWS;r++){
+    for(var c=0;c<COLS;c++){
+      var i = r * COLS + c;
+      if(arrive[i] > 1e8) continue;
+      var kind = grid[r][c], value = 1;
+      if(kind === 2) value = 1;
+      else if(kind === 3) value = (near >= 2 ? 7 : 1.6);      /* a real escape valve only when it is needed */
+      else value = 0;
+      if(fruitAlive && S.fruit.c === c && S.fruit.r === r){
+        if(arrive[i] * BOT_TICK + 900 > S.fruit.t) value = 0;  /* it will be gone before we get there */
+        else value = 9;                                        /* worth a detour, and it expires */
+      }
+      if(S.fright > 0){
+        for(var gi=0;gi<ghosts.length;gi++){
+          var g = ghosts[gi];
+          if(g.mode === "fright" && g.c === c && g.r === r && S.fright > arrive[i] * BOT_TICK + 900) value = 6;
+        }
+      }
+      if(!value) continue;
+      var cost = (arrive[i] + 4) / value;
+      if(first[i] === OPP[pac.dir]) cost += 1.5;        /* a u-turn must be worth it */
+      if(cached && cached.c === c && cached.r === r){ cachedCost = cost; continue; }
+      if(cost < bestCost){ bestCost = cost; best = { c:c, r:r, dir:first[i], arrive:Math.round(arrive[i]), cost:cost }; }
+    }
+  }
+  /* stick with the target we were already heading for unless something clearly better appeared:
+     equidistant pellets otherwise make the bot reverse on every replan and never arrive */
+  if(cached && cachedCost <= bestCost * 1.3 + 2){
+    var ci = cached.r * COLS + cached.c;
+    best = { c:cached.c, r:cached.r, dir:first[ci], arrive:Math.round(arrive[ci]), cost:cachedCost };
+  }
+  return best;
+}
+function botRankTargets(threat, arrive, first, perTile){
+  var out = [], cached = BOT.target, cachedIdx = -1;
+  var near = botGhostsClose(9), openNow = botGhostsClose(12);
+  var fruitAlive = !!S.fruit;
+  for(var r=0;r<ROWS;r++){
+    for(var c=0;c<COLS;c++){
+      var i = r * COLS + c;
+      if(arrive[i] > 1e8) continue;
+      var kind = grid[r][c], value = 1;
+      if(kind === 2) value = 1;
+      else if(kind === 3) value = (near >= 2 ? 7 : 1.6);
+      else value = 0;
+      if(fruitAlive && S.fruit.c === c && S.fruit.r === r){
+        if(arrive[i] * BOT_TICK + 900 > S.fruit.t) value = 0;
+        else value = 9;
+      }
+      if(S.fright > 0){
+        for(var gi=0;gi<ghosts.length;gi++){
+          var g = ghosts[gi];
+          if(g.mode === "fright" && g.c === c && g.r === r && S.fright > arrive[i] * BOT_TICK + 900) value = 6;
+        }
+      }
+      if(!value) continue;
+      var cost = (arrive[i] + 4) / value;
+      if(first[i] === OPP[pac.dir]) cost += 1.5;
+      out.push({ c:c, r:r, dir:first[i], arrive:Math.round(arrive[i]), cost:cost });
+    }
+  }
+  out.sort(function(a, b){ return a.cost - b.cost; });
+  if(cached){
+    for(var k=0;k<out.length;k++){
+      if(out[k].c === cached.c && out[k].r === cached.r){ cachedIdx = k; break; }
+    }
+    /* keep heading where we already were while it is still a sensible target */
+    if(cachedIdx > 0 && out[cachedIdx].cost <= out[0].cost * 1.3 + 2) out.unshift(out.splice(cachedIdx, 1)[0]);
+  }
+  return out;
+}
+function botThink(){
+  BOT.decisions++; BOT.age = 0; BOT.lastTile = pac.c + "," + pac.r;
+  var perTile = (1000 / pacSpeed()) / BOT_TICK;
+  var threat = botThreatMap();
+  BOT.threat = threat;
+  var frontier = botFrontier(perTile);
+  if(!frontier.length){ BOT.mode = "stuck"; BOT.goal = null; return; }
+  var reach = botReach(frontier, perTile), arrive = reach.arrive, first = reach.first;
+  var rc = 0;
+  for(var qi=0; qi<arrive.length; qi++) if(arrive[qi] < 1e8) rc++;
+  BOT.stats.reachable = rc;
+  /* nearest food that is safe to reach; if the board is temporarily all contested, allow
+     the hot tiles and lean on the pinch check below instead of standing still */
+  var cands = botRankTargets(threat, arrive, first, perTile);
+  if(!cands.length){ BOT.target = null; BOT.stats.noTarget++; botEscape(); return; }
+  /* evade on distance, like a player does, rather than waiting for the simulation to prove the
+     next 1.5 s is fatal — reacting that late is what got pac squeezed in corridors */
+  if(botGhostsClose(BOT.evadeRange) > 0){ BOT.stats.earlyEvade++; botEscape(); return; }
+  var threatNear = botGhostsClose(7);
+  for(var ci=0; ci<cands.length && ci<3; ci++){
+    var target = cands[ci];
+    if(!target.dir) continue;
+    if(threatNear > 0){
+      var world = { ghosts: [], pac: {}, goalC:target.c, goalR:target.r };
+      var dist = botDistField(target.c, target.r);
+      var gate = botRehearseMove(world, target.dir, dist, BOT.gateTicks);
+      BOT.rollouts++;
+      if(!gate.alive){ BOT.stats.gateReject++; continue; }     /* this route dies: try the next food */
+    }
+    BOT.target = { c:target.c, r:target.r, dir:target.dir };
+    BOT.goal = { c:target.c, r:target.r, arrive:target.arrive };
+    BOT.mode = "plan";
+    BOT.stats.plan++;
+    pac.want = target.dir;
+    return;
+  }
+  botEscape();
+}
+function autoPilotTick(){
+  BOT.age++;
+  var urgent = botGhostsClose(5) > 0;
+  /* Re-plan for EVERY tile pac enters, never on a tick-age gate: a missed arrival means the
+     stale direction is honoured at the junction, pac overshoots, and the next plan U-turns him
+     — which reads as a zig-zag that eats one third of the board per minute. */
+  var moved = (BOT.lastTile !== pac.c + "," + pac.r);
+  var due = BOT.age >= (urgent ? BOT.urgentEvery : BOT.thinkEvery);
+  if(!BOT.goal || moved || due) botThink();
 }
 
 /* ============================ main loop ============================ */
@@ -1945,7 +2327,69 @@ window.__pac = {
   },
   seed: function(n){ seed = n >>> 0 || 1; return seed; },
   freeze: function(on){ simFrozen = !!on; return simFrozen; },
-  speeds: function(){ return { pac: pacSpeed(), ghosts: ghosts.map(function(g){ return ghostSpeed(g); }) }; },
+  speeds: function(){ return { pac: Math.round(pacSpeed()*10)/10, ghosts: ghosts.map(function(g){ return Math.round(ghostSpeed(g)*10)/10; }) }; },
+  bot: function(){
+    return { mode: BOT.mode, decisions: BOT.decisions, age: BOT.age, horizon: BOT.horizon,
+             goal: BOT.goal, rollouts: BOT.rollouts, target: BOT.target, stats: BOT.stats, died: BOT.died,
+             threats: BOT.threat ? Array.prototype.slice.call(BOT.threat) : null };
+  },
+  botThreatAt: function(c, r){ return BOT.threat ? botThreatAt(BOT.threat, c, r) : null; },
+  botMap: function(){ return Array.prototype.slice.call(botThreatMap()); },
+  botDecision: function(){
+    var perTile = (1000 / pacSpeed()) / BOT_TICK;
+    var threat = botThreatMap();
+    var frontier = botFrontier(perTile);
+    var reach = botReach(frontier, perTile);
+    var t = botChooseTarget(threat, reach.arrive, reach.first, perTile);
+    var ti = t ? t.r * COLS + t.c : -1;
+    return { pac:{ c:pac.c, r:pac.r, p:+pac.p.toFixed(3), dir:pac.dir, moving:pac.moving, want:pac.want },
+             perTile:+perTile.toFixed(2),
+             frontier: frontier.map(function(f){ return f.c + "," + f.r + ":" + f.dir + "=" + f.cost.toFixed(1); }),
+             target: t, targetArrive: ti >= 0 ? +reach.arrive[ti].toFixed(1) : null,
+             targetFirst: ti >= 0 ? reach.first[ti] : null,
+             gridAtTarget: ti >= 0 ? grid[t.r][t.c] : null,
+             botTarget: BOT.target, mode: BOT.mode, stats: BOT.stats, goal: BOT.goal };
+  },
+  botWhy: function(){
+    var perTile = (1000 / pacSpeed()) / BOT_TICK;
+    var threat = botThreatMap();
+    var frontier = botFrontier(perTile);
+    var reach = botReach(frontier, perTile);
+    var cands = [];
+    for(var r=0;r<ROWS;r++){
+      for(var c=0;c<COLS;c++){
+        var i = r * COLS + c;
+        if(reach.arrive[i] > 1e8) continue;
+        if(grid[r][c] !== 2) continue;
+        cands.push({ c:c, r:r, arrive:Math.round(reach.arrive[i]), dir:reach.first[i] });
+      }
+    }
+    cands.sort(function(a, b){ return a.arrive - b.arrive; });
+    return { pac:{ c:pac.c, r:pac.r, p:+pac.p.toFixed(2), dir:pac.dir, moving:pac.moving, want:pac.want },
+             frontier:frontier, pelletsReachable:cands.length, nearest:cands.slice(0, 6),
+             ghosts: ghosts.map(function(g){ return { n:g.name, c:g.c, r:g.r, m:g.mode }; }),
+             close6: botGhostsClose(6), stats: BOT.stats, target: BOT.target, mode: BOT.mode };
+  },
+  simProbe: function(ticks){
+    var snapshot = ghosts.map(function(g){ return { n:g.name, c:g.c, r:g.r, p:g.p, m:g.mode, d:g.dir }; });
+    var clone = botClones(), keep = ghosts;
+    ghosts = clone;
+    for(var i=0;i<ticks;i++){ for(var k=0;k<clone.length;k++) ghostStep(clone[k], BOT_TICK/1000); }
+    ghosts = keep;
+    return { before:snapshot, sim:clone.map(function(g){ return { n:g.name, c:g.c, r:g.r, p:g.p, m:g.mode, d:g.dir }; }) };
+  },
+  stepReal: function(ticks){ for(var i=0;i<ticks;i++) tick(16.7); return true; },
+  simTrace: function(ticks){
+    var clone = botClones(), keep = ghosts, seq = [];
+    ghosts = clone;
+    for(var i=0;i<ticks;i++){
+      for(var k=0;k<clone.length;k++) ghostStep(clone[k], BOT_TICK/1000);
+      seq.push(clone.map(function(g){ return [g.c, g.r, g.mode]; }));
+    }
+    ghosts = keep;
+    return seq;
+  },
+  botPlans: function(){ return BOT.decisions; },
   modes: function(){ return MODES.map(function(m){ return m.id; }); }
 };
 window.__GAME_OK = true;
